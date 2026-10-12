@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset
 from ..utils.step_tracker import StepTracker
 from . import DatasetCfg, get_dataset
 from .types import DataShim, Stage
+from .validation_wrapper import ValidationWrapper
 
 
 def get_data_shim(encoder: nn.Module) -> DataShim:
@@ -41,7 +42,9 @@ class DataLoaderStageCfg:
 
 @dataclass
 class DataLoaderCfg:
+    train: DataLoaderStageCfg
     test: DataLoaderStageCfg
+    val: DataLoaderStageCfg
 
 
 DatasetShim = Callable[[Dataset, Stage], Dataset]
@@ -99,4 +102,29 @@ class DataModule(LightningDataModule):
             worker_init_fn=worker_init_fn,
             persistent_workers=self.get_persistent(self.data_loader_cfg.test),
             shuffle=False,
+        )
+
+    def train_dataloader(self):
+        dataset = get_dataset(self.dataset_cfg, "train", self.step_tracker)
+        dataset = self.dataset_shim(dataset, "train")
+        return DataLoader(
+            dataset,
+            self.data_loader_cfg.train.batch_size,
+            shuffle=not isinstance(dataset, IterableDataset),
+            num_workers=self.data_loader_cfg.train.num_workers,
+            generator=self.get_generator(self.data_loader_cfg.train),
+            worker_init_fn=worker_init_fn,
+            persistent_workers=self.get_persistent(self.data_loader_cfg.train),
+        )
+
+    def val_dataloader(self):
+        dataset = get_dataset(self.dataset_cfg, "val", self.step_tracker)
+        dataset = self.dataset_shim(dataset, "val")
+        return DataLoader(
+            ValidationWrapper(dataset, 1),
+            self.data_loader_cfg.val.batch_size,
+            num_workers=self.data_loader_cfg.val.num_workers,
+            generator=self.get_generator(self.data_loader_cfg.val),
+            worker_init_fn=worker_init_fn,
+            persistent_workers=self.get_persistent(self.data_loader_cfg.val),
         )

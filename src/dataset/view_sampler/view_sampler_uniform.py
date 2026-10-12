@@ -13,6 +13,7 @@ class ViewSamplerUniformCfg:
     name: Literal["uniform"]
     num_context_views: int
     num_target_views: int
+    start_index: int = 1
 
 
 class ViewSamplerUniform(ViewSampler[ViewSamplerUniformCfg]):
@@ -27,11 +28,25 @@ class ViewSamplerUniform(ViewSampler[ViewSamplerUniformCfg]):
         Int64[Tensor, " context_view"],  # indices for context views
         Int64[Tensor, " target_view"],  # indices for target views
     ]:
-        """Arbitrarily sample context and target views."""
+        """Sample evenly spaced context views and random target views."""
         num_views, _, _ = extrinsics.shape
-        index_context = torch.tensor(list(range(1, num_views, num_views//self.cfg.num_context_views)))
+        if self.cfg.start_index + self.cfg.num_context_views <= num_views:
+            index_context = torch.linspace(
+                self.cfg.start_index,
+                num_views - 1,
+                self.cfg.num_context_views,
+            ).round().long()
+        else:
+            index_context = torch.linspace(
+                0,
+                num_views - 1,
+                self.cfg.num_context_views,
+            ).round().long()
         available_target_indices = list(range(num_views))
-        index_target = torch.tensor(random.sample(available_target_indices, self.cfg.num_target_views))
+        index_target = torch.tensor(
+            random.sample(available_target_indices, self.cfg.num_target_views),
+            dtype=torch.int64,
+        )
         return index_context, index_target
 
     @property

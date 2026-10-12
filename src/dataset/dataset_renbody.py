@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 
 from .dataset import DatasetCfgCommon
 from .shims.crop_shim import apply_crop_shim
-from .shims.extr_shim import preprocess_poses
+from .shims.extr_shim import preprocess_poses, preprocess_sampled_views
 from .types import Stage
 from .view_sampler import ViewSampler
 
@@ -42,6 +42,7 @@ class DatasetRENBODYCfg(DatasetCfgCommon):
     random_view: bool = True
     num_views: int = 8
     norm_extrinsic: bool = True
+    norm_sampled_views: bool = False
     scene_scale_factor: float = 1.35
 
 class DatasetRENBODY(Dataset):
@@ -254,10 +255,12 @@ class DatasetRENBODY(Dataset):
         images_tensor = torch.stack(images, dim=0)
         masks_tensor = torch.stack(masks, dim=0)
 
+        scene_scale = 1.0 / self.cfg.scene_scale_factor
         if self.cfg.norm_extrinsic:
-            c2ws_tensor = preprocess_poses(
+            c2ws_tensor, scene_scale = preprocess_poses(
                 c2ws_tensor,
-                scene_scale_factor=self.cfg.scene_scale_factor
+                scene_scale_factor=self.cfg.scene_scale_factor,
+                return_scale=True,
             )
 
         intrinsics_3x3 = []
@@ -307,6 +310,15 @@ class DatasetRENBODY(Dataset):
             "scene": scene_name,
             "timestep": f"{frame_idx:06d}"
         }
+
+        if self.cfg.norm_sampled_views:
+            context_c2ws, target_c2ws = preprocess_sampled_views(
+                example["context"]["extrinsics"],
+                example["target"]["extrinsics"],
+                scene_scale=scene_scale,
+            )
+            example["context"]["extrinsics"] = context_c2ws
+            example["target"]["extrinsics"] = target_c2ws
 
         example = apply_crop_shim(example, tuple(self.cfg.image_shape))
 

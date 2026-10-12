@@ -99,7 +99,12 @@ def preprocess_sampled_views(
     processed_context_c2ws = avg_pose @ context_c2ws
     processed_target_c2ws = avg_pose @ target_c2ws
 
+    if not torch.isfinite(scene_scale) or scene_scale <= 0:
+        raise ValueError("scene_scale must be finite and positive")
+
     scene_scale_sampled = torch.max(torch.abs(processed_context_c2ws[:, :3, 3]))
+    if scene_scale_sampled <= torch.finfo(processed_context_c2ws.dtype).eps:
+        return processed_context_c2ws, processed_target_c2ws
     scale = scene_scale_sampled / scene_scale
 
     processed_context_c2ws[:, :3, 3] /= scale

@@ -1,0 +1,34 @@
+view_sampler:
+  name: mixed
+  num_context_views: 8
+  num_target_views: 24
+
+name: example
+roots: [datasets/example_dataset]
+
+image_shape: 512
+background_color: [0.0, 0.0, 0.0]
+cameras_are_circular: false
+overfit_to_scene: null
+
+near: 1.0e-3
+far: 2.0
+scene_scale_factor: 1.35
+shuffle: true
+shuffle_val: false
+train_times_per_scene: 1
+
+num_training_scenes: -1
+num_val_scenes: -1
+start_scene_training: 0
+start_scene_val: 0
+frame_per_training_scene: -1
+frame_per_val_scene: 1
+start_frame_training: 0
+start_frame_val: 0
+frame_gap_training: 1
+frame_gap_val: 1
+
+num_views: -1
+norm_extrinsic: true
+norm_sampled_views: true

@@ -1,3 +1,4 @@
 name: splatting_gsplat
 scale_invariant: true
 use_for_loop: true
+shuffle_background_color: false

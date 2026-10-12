@@ -71,6 +71,7 @@ class DecoderSplattingGSplatCfg:
     name: Literal["splatting_gsplat"]
     scale_invariant: bool
     use_for_loop: bool
+    shuffle_background_color: bool = False
 
 
 class DecoderSplattingGSplat(Decoder[DecoderSplattingGSplatCfg]):
@@ -91,6 +92,7 @@ class DecoderSplattingGSplat(Decoder[DecoderSplattingGSplatCfg]):
         self.render_func = rasterization
         self.scale_invariant = cfg.scale_invariant
         self.use_for_loop = cfg.use_for_loop
+        self.shuffle_background_color = cfg.shuffle_background_color
 
     def forward(
         self,
@@ -115,6 +117,8 @@ class DecoderSplattingGSplat(Decoder[DecoderSplattingGSplatCfg]):
         near = rearrange(near, "b v -> (b v)")
         far = rearrange(far, "b v -> (b v)")
         background_color = repeat(self.background_color, "c -> (b v) c", b=b, v=v)
+        if self.training and self.shuffle_background_color:
+            background_color = torch.rand_like(background_color)
         gaussian_means = repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v)
         gaussian_scales = repeat(gaussians.scales, "b g xyz -> (b v) g xyz", v=v)
         gaussian_rotations = repeat(gaussians.rotations, "b g xyzw -> (b v) g xyzw", v=v)
@@ -168,4 +172,9 @@ class DecoderSplattingGSplat(Decoder[DecoderSplattingGSplatCfg]):
         return DecoderOutput(
             renderings,
             None,
+            background_color=rearrange(
+                background_color,
+                "(b v) c -> b v c 1 1",
+                b=b,
+            ).expand_as(renderings),
         )

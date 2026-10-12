@@ -3,16 +3,18 @@ from torch.utils.data import Dataset
 from ..utils.step_tracker import StepTracker
 from .dataset_renbody import DatasetRENBODY, DatasetRENBODYCfg
 from .dataset_thuman import DatasetTHuman, DatasetTHumanCfg
+from .dataset_example import DatasetExample, DatasetExampleCfg
 from .types import Stage
 from .view_sampler import get_view_sampler
 
 DATASETS: dict[str, Dataset] = {
     "renbody": DatasetRENBODY,
     "thuman": DatasetTHuman,
+    "example": DatasetExample,
 }
 
 
-DatasetCfg = DatasetRENBODYCfg | DatasetTHumanCfg
+DatasetCfg = DatasetRENBODYCfg | DatasetTHumanCfg | DatasetExampleCfg
 
 
 def get_dataset(

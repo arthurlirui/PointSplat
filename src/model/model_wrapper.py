@@ -1,4 +1,5 @@
 import torch
+import time
 from einops import rearrange
 from pytorch_lightning import LightningModule
 import numpy as np
@@ -7,14 +8,17 @@ import os
 import torch.nn.functional as F
 import math
 from PIL import Image
+from torch import nn, optim
 
 from ..dataset.data_module import get_data_shim
 from ..dataset import DatasetCfg
 from ..global_cfg import get_cfg
+from ..loss import Loss
 
 from .encoder import Encoder, EncoderOutput
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
-from .decoder.decoder import Decoder, DecoderOutput
+from .decoder.decoder import Decoder, DecoderOutput, DepthRenderingMode
+from .types import Gaussians
 
 from ..utils.benchmarker import Benchmarker
 from ..utils.image_io import save_image, save_video
@@ -47,26 +51,50 @@ class TestCfg:
     move_to_cpu: bool
 
 
+@dataclass
+class OptimizerCfg:
+    lr: float
+    weight_decay: float
+
+
+@dataclass
+class TrainCfg:
+    depth_mode: DepthRenderingMode | None
+    print_log_every_n_steps: int
+    vis_every_n_steps: int
+    train_ignore_large_loss: float
+    mask_target: bool
+    mask_output: bool
+
+
 class ModelWrapper(LightningModule):
     dataset_cfg: DatasetCfg
     encoder: Encoder
     encoder_visualizer: Optional[EncoderVisualizer]
     decoder: Decoder
+    losses: nn.ModuleList
+    optimizer_cfg: OptimizerCfg
     test_cfg: TestCfg
+    train_cfg: TrainCfg
     step_tracker: StepTracker | None
 
     def __init__(
         self,
         dataset_cfg: DatasetCfg,
+        optimizer_cfg: OptimizerCfg,
         test_cfg: TestCfg,
+        train_cfg: TrainCfg,
         encoder: Encoder,
         encoder_visualizer: Optional[EncoderVisualizer],
         decoder: Decoder,
+        losses: list[Loss],
         step_tracker: StepTracker | None
     ) -> None:
         super().__init__()
         self.dataset_cfg = dataset_cfg
+        self.optimizer_cfg = optimizer_cfg
         self.test_cfg = test_cfg
+        self.train_cfg = train_cfg
         self.step_tracker = step_tracker
 
         # Set up the model.
@@ -74,6 +102,11 @@ class ModelWrapper(LightningModule):
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
+        self.losses = nn.ModuleList(losses)
+
+        self._train_step_start: float | None = None
+        self._backward_start: float | None = None
+        self._last_backward_time = 0.0
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
@@ -81,6 +114,230 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+
+    def _apply_supervision_masks(
+        self,
+        batch: dict,
+        output: DecoderOutput,
+    ) -> None:
+        target = batch["target"]
+        mask = target.get("mask", None)
+        if mask is None or not (
+            self.train_cfg.mask_target or self.train_cfg.mask_output
+        ):
+            return
+
+        mask_expanded = mask.expand_as(target["image"])
+        background = (
+            output.background_color
+            if output.background_color is not None
+            else torch.zeros_like(target["image"])
+        )
+        if self.train_cfg.mask_target:
+            target["image"] = (
+                target["image"] * mask_expanded
+                + (1.0 - mask_expanded) * background
+            )
+        if self.train_cfg.mask_output:
+            output.color = (
+                output.color * mask_expanded
+                + (1.0 - mask_expanded) * background
+            )
+
+    def _forward_training_batch(
+        self,
+        batch: dict,
+        log_metrics: bool = True,
+    ) -> tuple[EncoderOutput, DecoderOutput, Gaussians | None, torch.Tensor]:
+        _, _, _, height, width = batch["target"]["image"].shape
+        with self.benchmarker.time("encoder"):
+            encoder_output: EncoderOutput = self.encoder(
+                batch["context"],
+                self.global_step,
+                scene_names=batch["scene"],
+            )
+        encoder_output.context = batch["context"]
+        gaussians = encoder_output.gaussians
+        if gaussians is not None and log_metrics:
+            self.log("train/gs_num", gaussians.means.shape[1], sync_dist=True)
+
+        with self.benchmarker.time("decoder"):
+            output: DecoderOutput = self.decoder.forward(
+                encoder_output,
+                batch["target"]["extrinsics"],
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (height, width),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+
+        self._apply_supervision_masks(batch, output)
+        total_loss = batch["target"]["image"].new_tensor(0.0)
+        for loss_fn in self.losses:
+            loss = loss_fn.forward(
+                output,
+                batch,
+                gaussians,
+                self.global_step,
+            )
+            if log_metrics:
+                self.log(f"loss/{loss_fn.name}", loss, sync_dist=True)
+            total_loss = total_loss + loss
+        if log_metrics:
+            self.log("loss/total", total_loss, sync_dist=True)
+        return encoder_output, output, gaussians, total_loss
+
+    def _save_training_vis(
+        self,
+        batch: dict,
+        output: DecoderOutput,
+        prefix: str,
+    ) -> None:
+        if self.global_rank != 0:
+            return
+
+        output_dir = Path(get_cfg()["output_dir"]) / "training_vis"
+        step = self.global_step + 1
+        context = batch["context"]["image"][0].detach().cpu()
+        target = batch["target"]["image"][0].detach().cpu()
+        prediction = output.color[0].detach().cpu()
+        save_image(torch.cat(list(context), dim=-1), output_dir / f"{step:0>6}_{prefix}_context.png")
+        save_image(torch.cat(list(target), dim=-1), output_dir / f"{step:0>6}_{prefix}_target.png")
+        save_image(torch.cat(list(prediction), dim=-1), output_dir / f"{step:0>6}_{prefix}_prediction.png")
+
+    def on_train_batch_start(self, batch, batch_idx) -> None:
+        self._train_step_start = time.time()
+
+    def on_before_backward(self, loss) -> None:
+        self._backward_start = time.time()
+        return super().on_before_backward(loss)
+
+    def on_after_backward(self) -> None:
+        if self._backward_start is not None:
+            self._last_backward_time = time.time() - self._backward_start
+            self._backward_start = None
+        return super().on_after_backward()
+
+    def training_step(self, batch, batch_idx):
+        batch = self.data_shim(batch)
+        with self.benchmarker.time("forward"):
+            _, output, _, total_loss = self._forward_training_batch(batch)
+
+        psnr = compute_psnr(
+            rearrange(batch["target"]["image"], "b v c h w -> (b v) c h w"),
+            rearrange(output.color, "b v c h w -> (b v) c h w"),
+        ).mean()
+        self.log("train/psnr", psnr, sync_dist=True)
+        self.log("info/global_step", self.global_step, sync_dist=True)
+
+        if (
+            self.global_rank == 0
+            and (self.global_step + 1) % self.train_cfg.vis_every_n_steps == 0
+        ):
+            self._save_training_vis(batch, output, "train")
+
+        return total_loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        encoder_time = (
+            self.benchmarker.execution_times["encoder"][-1]
+            if self.benchmarker.execution_times["encoder"]
+            else 0.0
+        )
+        decoder_time = (
+            self.benchmarker.execution_times["decoder"][-1]
+            if self.benchmarker.execution_times["decoder"]
+            else 0.0
+        )
+        step_time = (
+            time.time() - self._train_step_start
+            if self._train_step_start is not None
+            else 0.0
+        )
+        self._train_step_start = None
+        self.log("train/encoder_time", encoder_time)
+        self.log("train/decoder_time", decoder_time)
+        self.log("train/backward_time", self._last_backward_time)
+        self.log("train/step_time", step_time)
+
+        if (
+            self.global_rank == 0
+            and self.global_step % self.train_cfg.print_log_every_n_steps == 0
+        ):
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+            lr = (
+                self.trainer.optimizers[0].param_groups[0]["lr"]
+                if self.trainer.optimizers
+                else self.optimizer_cfg.lr
+            )
+            print(
+                f"[Train Step {self.global_step:6d}] "
+                f"loss={float(loss):.6f} lr={float(lr):.2e} "
+                f"encoder={encoder_time:.3f}s decoder={decoder_time:.3f}s "
+                f"backward={self._last_backward_time:.3f}s step={step_time:.3f}s",
+                flush=True,
+            )
+
+        if self.step_tracker is not None:
+            self.step_tracker.set_step(self.global_step)
+
+    def validation_step(self, batch, batch_idx):
+        batch = self.data_shim(batch)
+        _, output, _, total_loss = self._forward_training_batch(
+            batch,
+            log_metrics=False,
+        )
+
+        self.log("val/loss", total_loss, on_step=False, on_epoch=True, sync_dist=True)
+        rgb_gt = rearrange(batch["target"]["image"], "b v c h w -> (b v) c h w")
+        rgb_pred = rearrange(output.color, "b v c h w -> (b v) c h w")
+        psnr = compute_psnr(rgb_gt, rgb_pred).mean()
+        lpips = compute_lpips(rgb_gt, rgb_pred).mean()
+        ssim = compute_ssim(rgb_gt, rgb_pred).mean()
+        self.log("val/psnr", psnr, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/lpips", lpips, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/ssim", ssim, on_step=False, on_epoch=True, sync_dist=True)
+
+        if (
+            self.global_rank == 0
+            and (self.global_step + 1) % self.train_cfg.vis_every_n_steps == 0
+        ):
+            self._save_training_vis(batch, output, "val")
+
+        if self.global_rank == 0 and batch_idx == 0:
+            print(
+                f"[Val Step {self.global_step:6d}] "
+                f"loss={float(total_loss):.6f} psnr={float(psnr):.3f} "
+                f"lpips={float(lpips):.3f} ssim={float(ssim):.3f}",
+                flush=True,
+            )
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=self.optimizer_cfg.lr,
+            weight_decay=self.optimizer_cfg.weight_decay,
+        )
+        total_steps = int(self.trainer.max_steps)
+        if total_steps <= 0:
+            total_steps = int(self.trainer.estimated_stepping_batches)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.optimizer_cfg.lr,
+            total_steps=max(1, total_steps + 10),
+            pct_start=0.01,
+            cycle_momentum=False,
+            anneal_strategy="cos",
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def test_step(self, batch, batch_idx):
         batch = self.data_shim(batch)

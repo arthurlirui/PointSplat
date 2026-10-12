@@ -20,6 +20,31 @@ from ..blocks.pointimage_transformer import PointImageMMJointTransformerBlock
 from .attention_processor.lrm_processor import _init_weights as init_weights
 from .common.gaussians import build_covariance
 
+
+def _sample_grid_coordinates(
+    x: Tensor,
+    y: Tensor,
+    z: Tensor,
+    max_grid_len: int,
+) -> tuple[Tensor, int]:
+    grid_len = x.numel() * y.numel() * z.numel()
+    if grid_len > max_grid_len:
+        # Avoid allocating a full permutation for large visual-hull grids.
+        return (
+            torch.stack(
+                [
+                    x[torch.randint(x.numel(), (max_grid_len,), device=x.device)],
+                    y[torch.randint(y.numel(), (max_grid_len,), device=y.device)],
+                    z[torch.randint(z.numel(), (max_grid_len,), device=z.device)],
+                ],
+                dim=-1,
+            ),
+            grid_len,
+        )
+    xx, yy, zz = torch.meshgrid(x, y, z, indexing="ij")
+    return torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3), grid_len
+
+
 @dataclass
 class ImageTokenizerCfg:
     patch_size: int
@@ -116,7 +141,11 @@ def feat2gaussian(
 def compute_vhull(masks: Float[Tensor, "*#batch view 1 H W"],
                   extrinsics: Float[Tensor, "*#batch view 4 4"],
                   intrinsics: Float[Tensor, "*#batch view 3 3"],
-                  bounds, resolution, min_cell_size=None, use_loop=False, disable_pbar=False, cube_sample=False):
+                  bounds,
+                  resolution,
+                  min_cell_size=None,
+                  cube_sample=False,
+                  max_grid_len_cap=6000000):
     """
     Compute visual hull from multi-view masks, with an option to use for-loop for memory efficiency.
     Args:
@@ -144,14 +173,11 @@ def compute_vhull(masks: Float[Tensor, "*#batch view 1 H W"],
     if cube_sample:
         sizes = bounds[:, 3:6] - bounds[:, 0:3]  # [B, 3]
         if min_cell_size is None:
-            min_cell_size = torch.min(sizes, dim=1)[0].min().item() / resolution
+            min_cell_size = torch.min(sizes, dim=1)[0].min().item() / resolution  # 全局最小cell
         steps = ((sizes / min_cell_size).floor().long()).clamp(min=1)  # [B, 3]
 
-        # Calculate grid sizes and find minimum to prevent OOM
-        grid_sizes = steps.prod(dim=1)  # [B]
-        min_grid_len = grid_sizes.min().item()
-
-        min_grid_len = min(8000000, min_grid_len)  # 1M points per batch
+        grid_sizes = steps.prod(dim=1)  # [B], N_x * N_y * N_z
+        max_grid_len = min(grid_sizes.max().item(), max_grid_len_cap)  # To avoid OOM
 
         coords_world = []
         for i in range(B):
@@ -165,22 +191,16 @@ def compute_vhull(masks: Float[Tensor, "*#batch view 1 H W"],
             y = torch.linspace(y_min, y_max, y_steps, device=device, dtype=torch.float32)
             z = torch.linspace(z_min, z_max, z_steps, device=device, dtype=torch.float32)
 
-            # Create meshgrid on GPU
-            xx, yy, zz = torch.meshgrid(x, y, z, indexing='ij')
-            grid = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)  # [N, 3]
+            grid, grid_len = _sample_grid_coordinates(x, y, z, max_grid_len)
 
-            if grid.shape[0] > min_grid_len:
-                # Use GPU-based random indices generation
-                indices = torch.randperm(grid.shape[0], device=device)[:min_grid_len]
-                grid = grid[indices]
-            elif grid.shape[0] < min_grid_len:
+            if grid_len < max_grid_len:
                 # Pad with repeated samples if needed (edge case)
-                repeat_factor = (min_grid_len + grid.shape[0] - 1) // grid.shape[0]
-                grid = grid.repeat(repeat_factor, 1)[:min_grid_len]
+                repeat_factor = (max_grid_len + grid.shape[0] - 1) // grid.shape[0]
+                grid = grid.repeat(repeat_factor, 1)[:max_grid_len]
 
             coords_world.append(grid)
 
-        coords_world = torch.stack(coords_world, dim=0)  # [B, min_grid_len, 3]
+        coords_world = torch.stack(coords_world, dim=0)  # [B, max_grid_len, 3]
     else:
         x_min, y_min, z_min, x_max, y_max, z_max = bounds.split(1, dim=1)
         x_lin = torch.linspace(0, 1, resolution, device=device)  # [N]
@@ -198,146 +218,69 @@ def compute_vhull(masks: Float[Tensor, "*#batch view 1 H W"],
 
     coords_world = coords_world.reshape(B, -1, 3)  # [B, N^3, 3]
 
-    if use_loop:
-        # Initialize accumulator for logits
-        logits_accum = torch.zeros((B, coords_world.shape[1]), device=device)
+    coords_homo = torch.cat([coords_world, torch.ones_like(coords_world[..., :1])], -1)  # [B, N^3, 4]
+    coords_homo = coords_homo.unsqueeze(1).expand(B, V, -1, 4).reshape(B*V, -1, 4)  # [B*V, N^3, 4]
 
-        # Chunk-based processing to balance memory and speed
-        chunk_size = 64
-        total_chunks = (B * V + chunk_size - 1) // chunk_size
+    w2c = torch.inverse(extrinsics.float()).view(B*V, 4, 4)
+    pts_cam = torch.bmm(coords_homo, w2c.transpose(1, 2))
 
-        for chunk_idx in range(total_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, B * V)
+    intrinsics = intrinsics.float()
+    fx, fy, cx, cy = (intrinsics[..., i, j].reshape(-1) for i, j in [(0, 0), (1, 1), (0, 2), (1, 2)])
 
-            # Process current chunk
-            chunk_logits = torch.zeros(
-                (end_idx - start_idx, coords_world.shape[1]), device=device)
+    z = pts_cam[..., 2] + 1e-8
+    u = (pts_cam[..., 0] / z) * fx[:, None] + cx[:, None]
+    v = (pts_cam[..., 1] / z) * fy[:, None] + cy[:, None]
 
-            for local_idx in range(end_idx - start_idx):
-                global_idx = start_idx + local_idx
-                b = global_idx // V
-                v = global_idx % V
+    u_norm = 2 * (u / (W - 1)) - 1
+    v_norm = 2 * (v / (H - 1)) - 1
+    grid = torch.stack([u_norm, v_norm], -1).unsqueeze(2)
 
-                if b >= B:  # Safety check
-                    continue
+    mask_flattened = masks.view(B*V, 1, H, W)
+    sampled = torch.nn.functional.grid_sample(
+        mask_flattened.float(),
+        grid,
+        align_corners=True,
+        mode='nearest'
+    ).squeeze()
 
-                coords = coords_world[b]
-                coords_homo = torch.cat(
-                    [coords, torch.ones(coords.shape[0], 1, device=device)], dim=-1)
+    valid_z = z > 0
+    valid_uv = (u >= 0) & (u <= W-1) & (v >= 0) & (v <= H-1)
+    valid = valid_z & valid_uv
 
-                # Compute world to camera transformation for current view
-                w2c = torch.inverse(extrinsics[b, v])  # [4, 4]
-
-                # Transform coordinates to camera space
-                pts_cam = coords_homo @ w2c.T  # [N^3, 4]
-
-                # Get camera intrinsics
-                fx, fy, cx, cy = intrinsics[b, v, 0, 0], intrinsics[b, v, 1, 1], intrinsics[b, v, 0, 2], intrinsics[b, v, 1, 2]
-
-                # Perspective projection
-                z = pts_cam[:, 2] + 1e-8  # [N^3]
-                u = (pts_cam[:, 0] / z) * fx + cx  # [N^3]
-                v_proj = (pts_cam[:, 1] / z) * fy + cy  # [N^3]
-
-                # Validity checks
-                valid_z = z > 0  # [N^3]
-                valid_uv = (u >= 0) & (
-                    u <= W-1) & (v_proj >= 0) & (v_proj <= H-1)
-                valid = valid_z & valid_uv  # [N^3]
-
-                # Normalize to [-1, 1] for grid_sample
-                u_norm = 2 * (u / (W - 1)) - 1  # [N^3]
-                v_norm = 2 * (v_proj / (H - 1)) - 1  # [N^3]
-                grid = torch.stack([u_norm, v_norm], dim=-
-                                   1).view(1, -1, 1, 2)  # [1, N^3, 1, 2]
-
-                # Sample mask for current view
-                mask = masks[b, v].float().view(
-                    1, 1, H, W)  # [1, 1, H, W]
-                sampled = torch.nn.functional.grid_sample(
-                    mask,
-                    grid,
-                    align_corners=True,
-                    mode='nearest'
-                ).squeeze()  # [N^3]
-
-                # Compute visibility: inside mask and valid
-                visibility = (sampled > 0.5) & valid
-                visibility = visibility.view(-1)  # [N^3]
-
-                # Store visibility for current chunk
-                chunk_logits[local_idx] = visibility.float()
-
-            # Accumulate chunk results back to main accumulator
-            for local_idx in range(end_idx - start_idx):
-                global_idx = start_idx + local_idx
-                b = global_idx // V
-                v = global_idx % V
-
-                if b >= B:  # Safety check
-                    continue
-
-                logits_accum[b] += chunk_logits[local_idx]
-
-        # Average over views
-        logits = logits_accum / V
-    else:
-        # Original batch processing implementation
-        coords_homo = torch.cat([coords_world, torch.ones_like(
-            coords_world[..., :1])], -1)  # [B, N^3, 4]
-        coords_homo = coords_homo.unsqueeze(1).expand(
-            B, V, -1, 4).reshape(B*V, -1, 4)  # [B*V, N^3, 4]
-
-        w2c = torch.inverse(extrinsics).view(B*V, 4, 4)
-        pts_cam = torch.bmm(coords_homo, w2c.transpose(1, 2))
-
-        # fx = fxfycxcys[..., 0].view(B*V)
-        # fy = fxfycxcys[..., 1].view(B*V)
-        # cx = fxfycxcys[..., 2].view(B*V)
-        # cy = fxfycxcys[..., 3].view(B*V)
-        fx, fy, cx, cy = intrinsics[..., 0, 0].view(B*V), intrinsics[..., 1, 1].view(B*V), intrinsics[..., 0, 2].view(B*V), intrinsics[..., 1, 2].view(B*V)
-
-        z = pts_cam[..., 2] + 1e-8
-        u = (pts_cam[..., 0] / z) * fx[:, None] + cx[:, None]
-        v = (pts_cam[..., 1] / z) * fy[:, None] + cy[:, None]
-
-        u_norm = 2 * (u / (W - 1)) - 1
-        v_norm = 2 * (v / (H - 1)) - 1
-        grid = torch.stack([u_norm, v_norm], -1).unsqueeze(2)
-
-        mask_flattened = masks.view(B*V, 1, H, W)
-        sampled = torch.nn.functional.grid_sample(
-            mask_flattened.float(),
-            grid,
-            align_corners=True,
-            mode='nearest'
-        ).squeeze()
-
-        valid_z = z > 0
-        valid_uv = (u >= 0) & (u <= W-1) & (v >= 0) & (v <= H-1)
-        valid = valid_z & valid_uv
-
-        visibility = (sampled > 0.5) & valid
-        visibility = visibility.view(B, V, -1)
-        logits = visibility.sum(dim=1) / V
-        logits = logits.reshape(B, -1).to(torch.float32)
+    visibility = (sampled > 0.5) & valid
+    visibility = visibility.view(B, V, -1)
+    logits = visibility.sum(dim=1) / V
+    logits = logits.reshape(B, -1).to(torch.float32)
     return logits, coords_world
 
 def get_vhull_points(masks: Float[Tensor, "*#batch view 1 H W"],
                      extrinsics: Float[Tensor, "*#batch view 4 4"],
                      intrinsics: Float[Tensor, "*#batch view 3 3"],
-                     bounds, resolution, min_cell_size= None, cube_sample=False, threshold=0.8, use_loop=True):
+                     bounds,
+                     resolution,
+                     min_cell_size= None,
+                     cube_sample=False,
+                     threshold=0.8,
+                     chunk_size=1,
+                     max_grid_len=6000000,
+                     use_loop=True):
         B, V = masks.shape[:2]
         vhull_batch_1, coords_world_1 = compute_vhull(masks,
                                                       extrinsics,
                                                       intrinsics,
                                                       bounds=bounds,
                                                       resolution=64,
-                                                      use_loop=False,
-                                                      disable_pbar=True,
                                                       cube_sample=False)
-        vhull_mask_1 = (vhull_batch_1 >= 0.5).view(B, -1)
+        fallback_bounds = torch.as_tensor(
+            bounds, device=masks.device, dtype=coords_world_1.dtype
+        )
+        if fallback_bounds.ndim == 0:
+            fallback_bounds = fallback_bounds.new_full((B, 6), fallback_bounds.item())
+            fallback_bounds[:, :3] *= -1
+        elif fallback_bounds.ndim == 1:
+            fallback_bounds = fallback_bounds.unsqueeze(0).expand(B, -1)
+        coarse_threshold = min(0.5, float(threshold))
+        vhull_mask_1 = (vhull_batch_1 >= coarse_threshold).view(B, -1)
         vhull_pts_1 = coords_world_1.view(B, -1, 3)
 
         vhull_mask = []
@@ -348,20 +291,51 @@ def get_vhull_points(masks: Float[Tensor, "*#batch view 1 H W"],
         bound_list = []
         for i in range(B):
             batch_pts = vhull_pts_1[i][vhull_mask_1[i]]
+            if batch_pts.numel() == 0:
+                # No common coarse voxel can occur under strong camera-pose
+                # perturbations. Keep the configured global bounds so the fine
+                # pass can return an empty hull instead of aborting inference.
+                bound_list.append(fallback_bounds[i].tolist())
+                continue
             min_bounds = batch_pts.min(dim=0)[0]  # [3]
             max_bounds = batch_pts.max(dim=0)[0]  # [3]
             bound_range = (max_bounds - min_bounds) * 1.2
             mid_point = (min_bounds + max_bounds) / 2
             bound_list.append(torch.cat([mid_point - bound_range / 2, mid_point + bound_range / 2]).tolist())
-        vhull_batch, coords_world = compute_vhull(masks,
-                                                  extrinsics,
-                                                  intrinsics,
-                                                  bounds=bound_list,
-                                                  resolution=resolution,
-                                                  min_cell_size = min_cell_size,
-                                                  use_loop=use_loop,
-                                                  disable_pbar=True,
-                                                  cube_sample=cube_sample)
+
+        # Process in chunks along batch dimension
+        vhull_batch_chunks = []
+        coords_world_chunks = []
+        for chunk_start in range(0, B, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, B)
+            chunk_masks = masks[chunk_start:chunk_end]
+            chunk_extrinsics = extrinsics[chunk_start:chunk_end]
+            chunk_intrinsics = intrinsics[chunk_start:chunk_end]
+            chunk_bound_list = bound_list[chunk_start:chunk_end]
+
+            chunk_vhull_batch, chunk_coords_world = compute_vhull(chunk_masks,
+                                                                  chunk_extrinsics,
+                                                                  chunk_intrinsics,
+                                                                  bounds=chunk_bound_list,
+                                                                  resolution=resolution,
+                                                                  min_cell_size = min_cell_size,
+                                                                  cube_sample=cube_sample,
+                                                                  max_grid_len_cap=max_grid_len)
+            vhull_batch_chunks.append(chunk_vhull_batch)
+            coords_world_chunks.append(chunk_coords_world)
+
+        # Concatenate results from all chunks
+        vhull_batch_padding_list = []
+        coords_world_padding_list = []
+        max_coord_len = max([chunk_coords_world.shape[1] for chunk_coords_world in coords_world_chunks])
+        for vhull_chunk, coords_world_chunk in zip(vhull_batch_chunks, coords_world_chunks):
+            if coords_world_chunk.shape[1] < max_coord_len:
+                vhull_chunk = torch.cat([vhull_chunk, torch.zeros(vhull_chunk.shape[0], max_coord_len - vhull_chunk.shape[1], device=vhull_chunk.device)], dim=1)
+                coords_world_chunk = torch.cat([coords_world_chunk, torch.zeros(coords_world_chunk.shape[0], max_coord_len - coords_world_chunk.shape[1], 3, device=coords_world_chunk.device)], dim=1)
+            vhull_batch_padding_list.append(vhull_chunk)
+            coords_world_padding_list.append(coords_world_chunk)
+        vhull_batch = torch.cat(vhull_batch_padding_list, dim=0)
+        coords_world = torch.cat(coords_world_padding_list, dim=0)
         vhull_mask = (vhull_batch >= threshold)
 
         # use vhull as xyz
@@ -946,8 +920,6 @@ class EncoderPointsplat(Encoder[EncoderPointsplatCfg]):
         visualization_dump: Optional[dict] = None,
         scene_names: Optional[list] = None,
     ) -> EncoderOutput:
-        assert self.training == False, "Only supports inference currently."
-
         context_mask = context['mask']
         B, v_input, _, H, W = context_mask.shape
 

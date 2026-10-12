@@ -134,6 +134,11 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main \
   checkpointing.pretrained_encoder=pretrained/pointsplat_mixed.pt
 ```
 
+## 🏋️ Training
+
+See [doc/training.md](doc/training.md) for fine-tuning, training from scratch,
+custom datasets, and debugging.
+
 ## 📚 Citation
 
 If you find this code useful for your research, please consider citing:

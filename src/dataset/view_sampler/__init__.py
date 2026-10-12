@@ -10,6 +10,7 @@ from .view_sampler_evaluation import ViewSamplerEvaluation, ViewSamplerEvaluatio
 from .view_sampler_bounded_v2 import ViewSamplerBoundedV2, ViewSamplerBoundedV2Cfg
 from .view_sampler_fps import ViewSamplerFPS, ViewSamplerFPSCfg
 from .view_sampler_uniform import ViewSamplerUniform, ViewSamplerUniformCfg
+from .view_sampler_mixed import ViewSamplerMixed, ViewSamplerMixedCfg
 
 
 VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
@@ -20,6 +21,7 @@ VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
     "boundedv2": ViewSamplerBoundedV2,
     "fps": ViewSamplerFPS,
     "uniform": ViewSamplerUniform,
+    "mixed": ViewSamplerMixed,
 }
 
 ViewSamplerCfg = (
@@ -30,6 +32,7 @@ ViewSamplerCfg = (
     | ViewSamplerBoundedV2Cfg
     | ViewSamplerFPSCfg
     | ViewSamplerUniformCfg
+    | ViewSamplerMixedCfg
 )
 
 

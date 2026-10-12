@@ -1,0 +1,53 @@
+# @package _global_
+
+defaults:
+  - override /dataset: renbody
+  - override /model/encoder: pointsplat
+  - override /model/decoder: splatting_gsplat
+  - override /loss: [mae, lpips]
+
+mode: train
+
+dataset:
+  near: 1.0e-3
+  norm_sampled_views: true
+  view_sampler:
+    name: mixed
+    num_context_views: 8
+    num_target_views: 24
+
+checkpointing:
+  pretrained_encoder: null
+  every_n_train_steps: 5000
+
+loss:
+  lpips:
+    weight: 1.0
+
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 0.01
+
+model:
+  encoder:
+    gaussians_decoder:
+      prune_ratio: 0.0
+      clip_scaling: [100.0, 1.0e-10, 3.0, 3000.0]
+  decoder:
+    scale_invariant: false
+    shuffle_background_color: true
+
+train:
+  mask_target: true
+  mask_output: false
+  print_log_every_n_steps: 100
+  vis_every_n_steps: 5000
+
+test:
+  mask_output: true
+  move_to_cpu: false
+
+trainer:
+  precision: bf16
+  max_steps: 300000
+  val_check_interval: 1.0

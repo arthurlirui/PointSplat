@@ -1,3 +1,4 @@
 lpips:
-  weight: 0.05
-  apply_after_step: 150_000
+  weight: 0.1
+  apply_after_step: 0
+  chunk_size: -1

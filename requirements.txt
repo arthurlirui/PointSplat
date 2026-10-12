@@ -17,6 +17,7 @@ plyfile
 pytorch_lightning==2.4.0
 scikit-image
 sk-video
+tensorboard
 tqdm
 xformers==0.0.27.post2
 rich
