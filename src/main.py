@@ -1,6 +1,19 @@
 import os
+import sys
 import warnings
 from pathlib import Path
+
+# Set up build environment for gsplat CUDA JIT compilation on Windows.
+# This must happen before any import that triggers gsplat's lazy CUDA backend.
+if sys.platform == "win32":
+    try:
+        # Add project root to path so we can import the setup module
+        _project_root = str(Path(__file__).resolve().parent.parent)
+        if _project_root not in sys.path:
+            sys.path.insert(0, _project_root)
+        import scripts.setup_build_env  # noqa: F401
+    except Exception:
+        pass
 
 import hydra
 import torch
