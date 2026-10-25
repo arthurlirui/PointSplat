@@ -131,3 +131,84 @@ def save_gaussians(gaussians,
     )
 
 
+def load_ply(
+    load_path: Path,
+    opacity_threshold: float | None = None,
+) -> dict[str, Tensor]:
+    """Load a Gaussian-splatting PLY (3DGS / PointSplat export format).
+
+    Returns a dict with keys ``xyz``, ``scales``, ``rotations``, ``harmonics``,
+    ``opacities``.  ``scales`` and ``opacities`` are returned in *activated*
+    form (i.e. ``exp`` and ``sigmoid`` already applied), matching the
+    convention used by :func:`export_ply`'s inverse.
+
+    ``opacity_threshold`` (0..1) optionally discards low-opacity Gaussians.
+    The function also tolerates plain sparse-point PLYs (e.g. COLMAP
+    ``sparse_pcd.ply``) that only carry ``x/y/z`` and (optionally) RGB;
+    missing Gaussian attributes are filled with sensible defaults so that
+    downstream alignment + visualization code can treat every loaded PLY
+    uniformly.
+    """
+    from plyfile import PlyData
+
+    ply = PlyData.read(str(load_path))
+    v = ply["vertex"].data
+    # plyfile returns a structured numpy array with non-contiguous strides
+    # when accessed per-field; convert each field to a contiguous tensor.
+    prop_names = {p.name for p in ply["vertex"].properties}
+
+    def _field(name: str) -> Tensor:
+        return torch.as_tensor(np.ascontiguousarray(v[name])).float()
+
+    xyz = torch.stack([_field("x"), _field("y"), _field("z")], dim=-1)
+
+    n = xyz.shape[0]
+
+    if "opacity" in prop_names:
+        opacities = torch.sigmoid(_field("opacity"))
+    else:
+        opacities = torch.ones(n, dtype=torch.float32)
+
+    if {f"scale_{i}" for i in range(3)}.issubset(prop_names):
+        scales = torch.exp(
+            torch.stack([_field("scale_0"), _field("scale_1"), _field("scale_2")], dim=-1)
+        )
+    else:
+        # Default splat size: 1% of the scene's diagonal extent.
+        diag = float((xyz.max(0).values - xyz.min(0).values).norm().item())
+        scales = torch.full((n, 3), max(diag, 1.0) * 0.01, dtype=torch.float32)
+
+    if {f"rot_{i}" for i in range(4)}.issubset(prop_names):
+        rotations = torch.stack([_field(f"rot_{i}") for i in range(4)], dim=-1)
+        # Re-normalize; PLY quaternions can drift slightly.
+        rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + 1e-9)
+    else:
+        rotations = torch.zeros(n, 4, dtype=torch.float32)
+        rotations[:, 0] = 1.0  # identity quaternion (w, x, y, z)
+
+    if {"f_dc_0", "f_dc_1", "f_dc_2"}.issubset(prop_names):
+        f_dc = torch.stack([_field(f"f_dc_{i}") for i in range(3)], dim=-1)  # (N, 3)
+        # SH DC -> RGB: 0.28209479 * C + 0.5
+        dc = f_dc * 0.28209479177387814 + 0.5
+        harmonics = dc.view(n, 3, 1)
+    elif {"red", "green", "blue"}.issubset(prop_names):
+        rgb = torch.stack([_field("red"), _field("green"), _field("blue")], dim=-1) / 255.0
+        harmonics = rgb.view(n, 3, 1)
+    else:
+        harmonics = torch.full((n, 3, 1), 0.5, dtype=torch.float32)
+
+    if opacity_threshold is not None:
+        keep = opacities > opacity_threshold
+        xyz, scales, rotations, harmonics, opacities = (
+            t[keep] for t in (xyz, scales, rotations, harmonics, opacities)
+        )
+
+    return {
+        "xyz": xyz,
+        "scales": scales,
+        "rotations": rotations,
+        "harmonics": harmonics,
+        "opacities": opacities,
+    }
+
+
